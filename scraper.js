@@ -3,7 +3,7 @@ const path = require("path");
 const fs = require("fs");
 const https = require("https");
 const { execSync } = require("child_process");
-
+const axios = require('axios');
 // ============================================================
 // CONFIGURATION
 // ============================================================
@@ -729,7 +729,41 @@ async function runOnce(context) {
     throw new Error(`Dashboard "${CONFIG.dashboardName}" failed to load`);
   }
 
-  const filename = await downloadDashboardToGDrive(dashPage);
+  //const filename = await downloadDashboardToGDrive(dashPage);
+  console.log("Extraindo dados da tabela...");
+
+  // 1. Extração dos Dados
+  const tableData = await dashPage.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('.particle-table-row'));
+    
+    return rows.map(row => {
+      const cells = Array.from(row.querySelectorAll('ess-cell'));
+      return {
+        domain: cells[0]?.innerText.trim(),
+        imprShare: cells[1]?.innerText.trim(),
+        overlapRate: cells[2]?.innerText.trim(),
+        aboveRate: cells[3]?.innerText.trim(),
+        topOfPage: cells[4]?.innerText.trim(),
+        absTop: cells[5]?.innerText.trim(),
+        outranking: cells[6]?.innerText.trim()
+      };
+    });
+  });
+  console.log("Dados extraídos:", tableData);
+  // 2. Envio para o Google Sheets via URL
+  const SCRIPT_URL = 'http://localhost:5678/webhook-test/a433b484-adaf-4072-a9d1-3bb17446bb3f';
+  
+  try {
+    if (tableData.length > 0) {
+      await axios.post(SCRIPT_URL, { auctionData: tableData }, {
+        headers: { 'Content-Type': 'application/json' }
+    });
+    } else {
+      console.log("⚠️ Nenhuma linha encontrada na tabela.");
+    }
+  } catch (err) {
+    console.error("❌ Erro ao enviar para o Sheets:", err.message);
+  }
 
   console.log(`\n${"=".repeat(50)}`);
   console.log("📋 SUMMARY");
@@ -814,7 +848,7 @@ async function main() {
     } catch {}
   } finally {
     stopKeepAlive();
-    await context.close();
+    //await context.close();
   }
 }
 
@@ -835,7 +869,7 @@ async function loginOnly() {
     await login(context);
     console.log("\n✅ Login session saved to: " + CONFIG.userDataDir);
   } finally {
-    await context.close();
+    //await context.close();
   }
 }
 
