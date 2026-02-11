@@ -365,9 +365,59 @@ async function downloadDashboardToGDrive(page) {
     throw new Error("Could not select Google Sheets format from dropdown");
   }
 
-  // Screenshot after selecting format - should show dialog
+  // Screenshot after selecting format
   await page.screenshot({ path: path.join(screenshotDir, "step2-after-format.png") });
   console.log("   Screenshot: step2-after-format.png");
+
+  // Step 2b: Handle OAuth account picker dialog
+  // After clicking "Google Sheets", Google may show a "Sign in to google.com" account picker
+  console.log("   Checking for OAuth account picker...");
+  try {
+    const accountPicker = page.locator(
+      'text="Sign in to google.com with google.com", text="Bei google.com anmelden", text="Choose an account", text="Konto auswählen"'
+    ).first();
+    if (await accountPicker.isVisible({ timeout: 5000 })) {
+      console.log("   OAuth account picker detected!");
+      await page.screenshot({ path: path.join(screenshotDir, "step2b-account-picker.png") });
+
+      // Click on the account (kastri.asani@hurra.com)
+      const accountSelectors = [
+        'div[data-email="kastri.asani@hurra.com"]',
+        'li:has-text("kastri.asani@hurra.com")',
+        'div:has-text("kastri.asani@hurra.com")',
+        'text="kastri.asani@hurra.com"',
+        'text="Kastri Asani"',
+      ];
+      let accountClicked = false;
+      for (const sel of accountSelectors) {
+        try {
+          const el = page.locator(sel).first();
+          if (await el.isVisible({ timeout: 3000 })) {
+            await el.click();
+            accountClicked = true;
+            console.log(`   ✅ Selected account via: ${sel}`);
+            await page.waitForTimeout(5000);
+            break;
+          }
+        } catch {}
+      }
+      if (!accountClicked) {
+        console.log("   ⚠️  Could not click account, trying first list item...");
+        // Fallback: click first account in list
+        try {
+          const firstAccount = page.locator('ul li').first();
+          await firstAccount.click();
+          console.log("   Clicked first account in list");
+          await page.waitForTimeout(5000);
+        } catch {}
+      }
+      await page.screenshot({ path: path.join(screenshotDir, "step2b-after-account.png") });
+    } else {
+      console.log("   No account picker (already authorized)");
+    }
+  } catch {
+    console.log("   No account picker detected");
+  }
 
   // Step 3: Wait for the download dialog
   // Try multiple detection strategies - the dialog has a filename input and a Download button
@@ -414,6 +464,78 @@ async function downloadDashboardToGDrive(page) {
   } catch {
     console.log("   Using default filename");
   }
+
+  // Step 4b: Select folder "Auction Insight > Raw"
+  // The dialog has a folder picker (e.g. "Meine Ablage" / "My Drive" dropdown)
+  console.log("   Looking for folder selector...");
+  try {
+    // Look for the folder selector/link in the dialog
+    const folderSelectors = [
+      'text="Meine Ablage"',
+      'text="My Drive"',
+      '[aria-label*="folder"]',
+      '[aria-label*="Ordner"]',
+      'button:has-text("Meine Ablage")',
+      'button:has-text("My Drive")',
+      // The folder selector might be a link/button showing current folder
+      'a:has-text("Meine Ablage")',
+      'a:has-text("My Drive")',
+    ];
+    let folderSelectorClicked = false;
+    for (const sel of folderSelectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 3000 })) {
+          await el.click();
+          folderSelectorClicked = true;
+          console.log(`   Clicked folder selector via: ${sel}`);
+          await page.waitForTimeout(3000);
+          break;
+        }
+      } catch {}
+    }
+
+    if (folderSelectorClicked) {
+      await page.screenshot({ path: path.join(screenshotDir, "step4b-folder-picker.png") });
+
+      // Navigate to "Auction Insight" folder
+      try {
+        const auctionFolder = page.locator('text="Auction Insight"').first();
+        if (await auctionFolder.isVisible({ timeout: 5000 })) {
+          await auctionFolder.click({ clickCount: 2 }); // double-click to open
+          console.log("   Opened 'Auction Insight' folder");
+          await page.waitForTimeout(2000);
+
+          // Navigate to "Raw" subfolder
+          const rawFolder = page.locator('text="Raw"').first();
+          if (await rawFolder.isVisible({ timeout: 5000 })) {
+            await rawFolder.click({ clickCount: 2 });
+            console.log("   Opened 'Raw' subfolder");
+            await page.waitForTimeout(2000);
+          }
+
+          // Click Select/Auswählen button to confirm folder
+          for (const btnName of ["Select", "Auswählen", "Open", "Öffnen"]) {
+            try {
+              const btn = page.getByRole("button", { name: btnName, exact: true });
+              if (await btn.isVisible({ timeout: 2000 })) {
+                await btn.click();
+                console.log(`   ✅ Folder selected via "${btnName}"`);
+                await page.waitForTimeout(2000);
+                break;
+              }
+            } catch {}
+          }
+        } else {
+          console.log("   'Auction Insight' folder not found in picker");
+        }
+      } catch (e) {
+        console.log(`   Folder navigation error: ${e.message}`);
+      }
+    } else {
+      console.log("   No folder selector found in dialog (may default to My Drive)");
+    }
+  } catch {}
 
   // Screenshot BEFORE clicking Download
   await page.screenshot({ path: path.join(screenshotDir, "step4-before-download.png") });
