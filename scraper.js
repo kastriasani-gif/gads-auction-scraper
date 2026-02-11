@@ -451,54 +451,63 @@ async function downloadDashboardToGDrive(page) {
   await page.screenshot({ path: path.join(screenshotDir, "step2-after-format.png") });
   console.log("   Screenshot: step2-after-format.png");
 
-  // Step 2b: Handle OAuth account picker dialog
-  // After clicking "Google Sheets", Google may show a "Sign in to google.com" account picker
-  console.log("   Checking for OAuth account picker...");
-  try {
-    const accountPicker = page.locator(
-      'text="Sign in to google.com with google.com", text="Bei google.com anmelden", text="Choose an account", text="Konto auswählen"'
-    ).first();
-    if (await accountPicker.isVisible({ timeout: 5000 })) {
-      console.log("   OAuth account picker detected!");
-      await page.screenshot({ path: path.join(screenshotDir, "step2b-account-picker.png") });
+  // Step 2b: Handle OAuth account picker POPUP WINDOW
+  // The OAuth picker opens as a separate popup (not iframe, not in main DOM).
+  // Playwright catches new pages via context.on('page').
+  console.log("   Waiting for OAuth popup or download dialog...");
+  let oauthHandled = false;
+  const ctx = page.context();
 
-      // Click on the account (kastri.asani@hurra.com)
-      const accountSelectors = [
-        'div[data-email="kastri.asani@hurra.com"]',
-        'li:has-text("kastri.asani@hurra.com")',
-        'div:has-text("kastri.asani@hurra.com")',
-        'text="kastri.asani@hurra.com"',
-        'text="Kastri Asani"',
-      ];
-      let accountClicked = false;
-      for (const sel of accountSelectors) {
-        try {
-          const el = page.locator(sel).first();
-          if (await el.isVisible({ timeout: 3000 })) {
-            await el.click();
-            accountClicked = true;
-            console.log(`   ✅ Selected account via: ${sel}`);
-            await page.waitForTimeout(5000);
-            break;
-          }
-        } catch {}
+  // Register popup handler BEFORE it appears
+  const popupHandler = async (popup) => {
+    const url = popup.url();
+    console.log(`   New popup opened: ${url}`);
+    if (url.includes("accounts.google.com")) {
+      console.log("   OAuth account picker popup detected!");
+      try {
+        await popup.waitForLoadState("domcontentloaded");
+        await popup.screenshot({ path: path.join(screenshotDir, "step2b-oauth-popup.png") });
+
+        // Click the account (kastri.asani@hurra.com)
+        const accountSelectors = [
+          '[data-email="kastri.asani@hurra.com"]',
+          'li:has-text("kastri.asani@hurra.com")',
+          'text="kastri.asani@hurra.com"',
+          'text="Kastri Asani"',
+        ];
+        let accountClicked = false;
+        for (const sel of accountSelectors) {
+          try {
+            const el = popup.locator(sel).first();
+            if (await el.isVisible({ timeout: 3000 })) {
+              await el.click();
+              accountClicked = true;
+              console.log(`   ✅ Selected account via: ${sel}`);
+              break;
+            }
+          } catch {}
+        }
+        if (!accountClicked) {
+          // Fallback: click first account in list
+          try {
+            const firstItem = popup.locator("ul li, div[data-email]").first();
+            await firstItem.click();
+            console.log("   Clicked first account in popup");
+          } catch {}
+        }
+        oauthHandled = true;
+      } catch (e) {
+        console.log(`   OAuth popup error: ${e.message}`);
       }
-      if (!accountClicked) {
-        console.log("   ⚠️  Could not click account, trying first list item...");
-        // Fallback: click first account in list
-        try {
-          const firstAccount = page.locator('ul li').first();
-          await firstAccount.click();
-          console.log("   Clicked first account in list");
-          await page.waitForTimeout(5000);
-        } catch {}
-      }
-      await page.screenshot({ path: path.join(screenshotDir, "step2b-after-account.png") });
-    } else {
-      console.log("   No account picker (already authorized)");
     }
-  } catch {
-    console.log("   No account picker detected");
+  };
+  ctx.on("page", popupHandler);
+
+  // Give OAuth popup time to appear (it may or may not show)
+  await page.waitForTimeout(8000);
+  ctx.removeListener("page", popupHandler);
+  if (!oauthHandled) {
+    console.log("   No OAuth popup (already authorized)");
   }
 
   // Step 3: Wait for the download dialog
@@ -535,11 +544,16 @@ async function downloadDashboardToGDrive(page) {
   console.log("   Screenshot: step3-dialog.png");
 
   // Step 4: Fill in the filename
+  // NOTE: Material Web Components ignore fill() and clickCount:3.
+  // Use Ctrl+A to select all, then keyboard.type() for reliable input.
   try {
     const filenameInput = page.locator('input[aria-label="Dateiname"], input[aria-label="File name"], input[type="text"]').first();
     if (await filenameInput.isVisible({ timeout: 5000 })) {
-      await filenameInput.click({ clickCount: 3 });
-      await filenameInput.fill(filename);
+      await filenameInput.click();
+      await page.waitForTimeout(300);
+      await page.keyboard.press("Control+a");
+      await page.waitForTimeout(200);
+      await page.keyboard.type(filename, { delay: 30 });
       console.log(`   Filename: ${filename}`);
       await page.waitForTimeout(1000);
     }
@@ -624,9 +638,10 @@ async function downloadDashboardToGDrive(page) {
   console.log("   Screenshot: step4-before-download.png");
 
   // Step 5: Click the Download/Herunterladen button
+  // Material Web Components may ignore standard click() — use coordinate-based mouse click as fallback
   let confirmClicked = false;
 
-  // Use getByRole('button') for precise targeting — avoids clicking the dialog title
+  // Strategy 1: getByRole('button')
   for (const name of ["Download", "Herunterladen"]) {
     try {
       const btn = page.getByRole("button", { name, exact: true });
@@ -635,6 +650,32 @@ async function downloadDashboardToGDrive(page) {
         confirmClicked = true;
         console.log(`   Clicked "${name}" button via getByRole`);
         break;
+      }
+    } catch {}
+  }
+
+  // Strategy 2: Find by text and use coordinate-based mouse click
+  if (!confirmClicked) {
+    try {
+      const rect = await page.evaluate(() => {
+        const allEls = document.querySelectorAll("button, material-button, [role='button'], [class*='button']");
+        for (const el of allEls) {
+          const text = el.textContent?.trim();
+          if (text === "Herunterladen" || text === "Download") {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              return { x: r.x, y: r.y, width: r.width, height: r.height };
+            }
+          }
+        }
+        return null;
+      });
+      if (rect) {
+        const cx = rect.x + rect.width / 2;
+        const cy = rect.y + rect.height / 2;
+        await page.mouse.click(cx, cy);
+        confirmClicked = true;
+        console.log(`   Clicked "Herunterladen" button via mouse.click(${cx}, ${cy})`);
       }
     } catch {}
   }
@@ -650,16 +691,23 @@ async function downloadDashboardToGDrive(page) {
   console.log("   Screenshot: step5-after-download.png");
 
   // Step 6: Wait for the success toast (EN or DE)
+  // Poll document.body.innerText — more reliable with dynamic Material toasts
   let toastFound = false;
-  try {
-    await Promise.race([
-      page.locator('text="Report downloaded to Sheets"').first().waitFor({ state: "visible", timeout: 30000 }),
-      page.locator('text="Bericht wurde in Google Sheets heruntergeladen"').first().waitFor({ state: "visible", timeout: 30000 }),
-    ]);
-    toastFound = true;
-    console.log("   ✅ Saved to Google Drive!");
-  } catch {
-    console.log("   ⚠️  No success toast detected after 30s");
+  const toastKeywords = ["heruntergeladen", "downloaded to sheets", "exported"];
+  const toastStart = Date.now();
+  while (Date.now() - toastStart < 45000) {
+    try {
+      const bodyText = await page.evaluate(() => document.body.innerText.toLowerCase());
+      if (toastKeywords.some((kw) => bodyText.includes(kw))) {
+        toastFound = true;
+        console.log("   ✅ Saved to Google Drive!");
+        break;
+      }
+    } catch {}
+    await page.waitForTimeout(2000);
+  }
+  if (!toastFound) {
+    console.log("   ⚠️  No success toast detected after 45s");
     await page.screenshot({ path: path.join(screenshotDir, "step6-no-toast.png") });
   }
 
