@@ -1,6 +1,8 @@
 const { chromium } = require("playwright");
 const path = require("path");
 const fs = require("fs");
+const https = require("https");
+const { execSync } = require("child_process");
 
 // ============================================================
 // CONFIGURATION
@@ -30,7 +32,83 @@ const CONFIG = {
 
   // Timeout for page loads (ms)
   timeout: 60000,
+
+  // Keep-alive interval (ms) — pings Google Ads to prevent session expiry
+  keepAliveInterval: 6 * 60 * 60 * 1000, // 6 hours
+
+  // Email alert settings (uses system mail or SMTP)
+  alert: {
+    enabled: true,
+    to: "kastri@mikgroup.ch",
+    from: "scraper@gads-automation.local",
+    // Simple webhook/SMTP — set SMTP_* env vars on the server
+    // or use: apt install msmtp msmtp-mta
+  },
 };
+
+// ============================================================
+// ALERTING
+// ============================================================
+
+async function sendAlert(subject, body) {
+  if (!CONFIG.alert.enabled) return;
+  console.log(`🔔 ALERT: ${subject}`);
+  try {
+    // Try system mail first (msmtp, sendmail, or mail)
+    const mailBody = `Subject: ${subject}\nFrom: ${CONFIG.alert.from}\nTo: ${CONFIG.alert.to}\n\n${body}`;
+    const tmpFile = path.join(CONFIG.downloadDir, ".alert-mail.txt");
+    fs.writeFileSync(tmpFile, mailBody);
+    try {
+      execSync(`sendmail ${CONFIG.alert.to} < ${tmpFile} 2>/dev/null || mail -s "${subject}" ${CONFIG.alert.to} < ${tmpFile} 2>/dev/null`, { timeout: 10000 });
+      console.log(`   ✅ Alert sent to ${CONFIG.alert.to}`);
+    } catch {
+      console.log(`   ⚠️  Mail command failed — install msmtp: apt install msmtp msmtp-mta`);
+      console.log(`   Alert body: ${body}`);
+    }
+    try { fs.unlinkSync(tmpFile); } catch {}
+  } catch (e) {
+    console.log(`   Alert error: ${e.message}`);
+  }
+}
+
+// ============================================================
+// KEEP-ALIVE
+// ============================================================
+
+let keepAliveTimer = null;
+
+function startKeepAlive(context) {
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
+  keepAliveTimer = setInterval(async () => {
+    try {
+      const pages = context.pages();
+      if (pages.length === 0) return;
+      const p = pages[0];
+      const urlBefore = p.url();
+      // Navigate to Google Ads overview to keep session warm
+      await p.goto("https://ads.google.com/aw/overview", { timeout: 30000, waitUntil: "domcontentloaded" }).catch(() => {});
+      const urlAfter = p.url();
+      const isLoggedIn = urlAfter.includes("ads.google.com/aw/");
+      console.log(`🔄 Keep-alive ping: ${isLoggedIn ? "✅ session active" : "⚠️ session expired"} (${new Date().toISOString()})`);
+      if (!isLoggedIn) {
+        await sendAlert(
+          "[GAds Scraper] Session abgelaufen — Login nötig",
+          `Google Ads Session ist abgelaufen.\n\nBitte einloggen via VNC:\nhttp://49.12.229.75:6080/vnc.html\n\nZeit: ${new Date().toISOString()}`
+        );
+      }
+    } catch (e) {
+      console.log(`🔄 Keep-alive error: ${e.message}`);
+    }
+  }, CONFIG.keepAliveInterval);
+  console.log(`🔄 Keep-alive started (every ${CONFIG.keepAliveInterval / 3600000}h)`);
+}
+
+function stopKeepAlive() {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+}
 
 // ============================================================
 // BROWSER & LOGIN
@@ -181,12 +259,16 @@ async function login(context) {
     }
   } catch {}
 
-  // Need to login
+  // Need to login — alert user
   console.log("");
   console.log("⚠️  LOGIN REQUIRED");
   console.log("   Please log in manually in the browser window.");
   console.log("   The script will continue automatically after login.");
   console.log("");
+  await sendAlert(
+    "[GAds Scraper] Login nötig",
+    `Google Ads Scraper braucht manuellen Login.\n\nVNC: http://49.12.229.75:6080/vnc.html\n\nZeit: ${new Date().toISOString()}`
+  );
 
   // Wait for any tab to reach Google Ads (handles new tab from MCC selector)
   const adsPage = await waitForAdsPage(context);
@@ -626,7 +708,13 @@ async function main() {
     // First run — may require manual login
     await runOnce(context);
 
-    if (once) return;
+    if (once) {
+      console.log("\n✅ Single run complete. Exiting.");
+      return;
+    }
+
+    // Start keep-alive pings to prevent session expiry
+    startKeepAlive(context);
 
     // Schedule weekly repeats, keeping browser alive
     while (true) {
@@ -640,9 +728,16 @@ async function main() {
 
       try {
         await runOnce(context);
+        await sendAlert(
+          "[GAds Scraper] ✅ Download erfolgreich",
+          `Auktion_ROB_Weekly wurde erfolgreich heruntergeladen.\nZeit: ${new Date().toISOString()}`
+        );
       } catch (err) {
         console.error(`\n❌ Weekly run failed: ${err.message}`);
-        console.log("   Will retry at next scheduled time.");
+        await sendAlert(
+          "[GAds Scraper] ❌ Download fehlgeschlagen",
+          `Fehler: ${err.message}\n\nVNC: http://49.12.229.75:6080/vnc.html\nZeit: ${new Date().toISOString()}`
+        );
         try {
           const pages = context.pages();
           const activePage = pages[pages.length - 1];
@@ -656,7 +751,10 @@ async function main() {
     }
   } catch (err) {
     console.error(`\n❌ Fatal error: ${err.message}`);
-    console.log("\nTaking screenshot for debugging...");
+    await sendAlert(
+      "[GAds Scraper] ❌ Fatal Error",
+      `Scraper gestoppt: ${err.message}\n\nBitte manuell neu starten.\nZeit: ${new Date().toISOString()}`
+    );
     try {
       const pages = context.pages();
       const activePage = pages[pages.length - 1];
@@ -664,10 +762,10 @@ async function main() {
         await activePage.screenshot({
           path: path.join(CONFIG.downloadDir, "error-screenshot.png"),
         });
-        console.log("   Screenshot saved to error-screenshot.png");
       }
     } catch {}
   } finally {
+    stopKeepAlive();
     await context.close();
   }
 }
