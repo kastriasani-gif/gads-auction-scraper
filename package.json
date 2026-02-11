@@ -2,9 +2,11 @@
   "name": "gads-auction-scraper",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "scraper.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node scraper.js",
+    "login": "node scraper.js --login-only",
+    "setup": "npx playwright install chromium"
   },
   "keywords": [],
   "author": "",
