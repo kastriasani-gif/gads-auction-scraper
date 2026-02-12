@@ -1,0 +1,10 @@
+node_modules/
+browser-data/
+downloads/
+*.png
+*.html
+*.txt
+!README.md
+.env
+*.log
+*.service
