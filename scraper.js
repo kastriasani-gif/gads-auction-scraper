@@ -37,7 +37,7 @@ const CONFIG = {
   // Email alert settings
   alert: {
     enabled: true,
-    to: "kastri@mikgroup.ch",
+    to: "kastri.asani@hurra.com",
     from: "scraper@gads-automation.local",
   },
 };
