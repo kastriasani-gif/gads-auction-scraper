@@ -1,8 +1,9 @@
+process.env.DISPLAY = ":99";
 const { chromium } = require("playwright");
+const http = require("http");
 const path = require("path");
 const fs = require("fs");
 const { execSync } = require("child_process");
-const axios = require("axios");
 
 // ============================================================
 // CONFIGURATION
@@ -20,9 +21,6 @@ const CONFIG = {
 
   // Browser state directory
   userDataDir: path.join(__dirname, "browser-data"),
-
-  // n8n Webhook URL for data delivery
-  webhookUrl: "https://n8n.hurra.com/webhook-test/e3854837-8069-4e1f-9016-0203ec5fa052",
 
   // Headless mode
   headless: false,
@@ -120,6 +118,12 @@ async function ensureDirs() {
 }
 
 async function launchBrowser() {
+  // Clean stale lock files that prevent browser launch
+  for (const f of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+    const p = path.join(CONFIG.userDataDir, f);
+    try { fs.unlinkSync(p); } catch {}
+  }
+
   return await chromium.launchPersistentContext(CONFIG.userDataDir, {
     headless: CONFIG.headless,
     slowMo: CONFIG.slowMo,
@@ -128,6 +132,8 @@ async function launchBrowser() {
       "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
       "--disable-setuid-sandbox",
+      "--disable-session-crashed-bubble",
+      "--disable-infobars",
     ],
     ignoreDefaultArgs: ["--enable-automation"],
   });
@@ -195,13 +201,23 @@ async function waitForAdsPage(context, timeoutMs = 300000) {
 }
 
 async function login(context) {
-  const page = context.pages()[0] || (await context.newPage());
+  let page = context.pages()[0] || (await context.newPage());
 
   console.log("🔐 Navigating to Google Ads...");
   try {
     await page.goto("https://ads.google.com", { waitUntil: "networkidle", timeout: CONFIG.timeout });
   } catch (e) {
     console.log("   Navigation: " + e.message.split("\n")[0]);
+    // If page is dead (restored from crashed session), create a fresh one
+    if (e.message.includes("Target page, context or browser has been closed")) {
+      console.log("   ↪ Page crashed, opening new tab...");
+      page = await context.newPage();
+      try {
+        await page.goto("https://ads.google.com", { waitUntil: "networkidle", timeout: CONFIG.timeout });
+      } catch (e2) {
+        console.log("   Navigation retry: " + e2.message.split("\n")[0]);
+      }
+    }
   }
 
   // Handle cookie consent
@@ -214,6 +230,38 @@ async function login(context) {
             await el.click();
             console.log("   ✅ Cookie consent handled");
             await page.waitForTimeout(3000);
+            break;
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  // Redirect from business.google.com to actual Ads interface
+  try {
+    if (page.url().includes("business.google.com")) {
+      console.log("   ↪ Redirecting from business.google.com to ads.google.com...");
+      await page.goto("https://ads.google.com/aw/overview", { waitUntil: "domcontentloaded", timeout: CONFIG.timeout });
+      await page.waitForTimeout(3000);
+    }
+  } catch {}
+
+  // Handle MCC account picker ("Google Ads-Konto auswählen")
+  try {
+    const hasAccountPicker = await page.locator(':text("Konto auswählen"), :text("Choose an account")').first().isVisible({ timeout: 3000 });
+    if (hasAccountPicker) {
+      console.log("   🏢 Account picker detected, selecting MCC account...");
+      for (const sel of [
+        `:text("${CONFIG.mccAccountId}")`,
+        ':text("Hurra Communications")',
+        `[data-account-id*="${CONFIG.mccAccountId.replace(/-/g, "")}"]`,
+      ]) {
+        try {
+          const el = page.locator(sel).first();
+          if (await el.isVisible({ timeout: 3000 })) {
+            await el.click();
+            console.log(`   ✅ Selected account via: ${sel}`);
+            await page.waitForTimeout(5000);
             break;
           }
         } catch {}
@@ -303,134 +351,6 @@ async function openDashboard(page, context) {
   return null;
 }
 
-// ============================================================
-// DATE RANGE: "Letzte 7 Tage (bis gestern)"
-// ============================================================
-
-async function setDateRange(page) {
-  console.log("📅 Setting date range: Letzte 7 Tage...");
-  const screenshotDir = CONFIG.downloadDir;
-
-  try {
-    // Click the date range button in the toolbar
-    // Google Ads shows the current date range as a button/dropdown in the top bar
-    const dateSelectors = [
-      '[aria-label="Zeitraum"]',
-      '[aria-label="Date range"]',
-      'button:has-text("Letzte")',
-      'button:has-text("Last")',
-      // The date range often shows the actual dates like "1. Feb – 7. Feb 2026"
-      'material-button:has-text("Feb")',
-      'material-button:has-text("Jan")',
-      'material-button:has-text("Mär")',
-      // Generic date picker button
-      '[class*="date-range"]',
-      '[class*="dateRange"]',
-    ];
-
-    let datePickerClicked = false;
-    for (const sel of dateSelectors) {
-      try {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 3000 })) {
-          await el.click();
-          datePickerClicked = true;
-          console.log(`   Clicked date picker via: ${sel}`);
-          await page.waitForTimeout(2000);
-          break;
-        }
-      } catch {}
-    }
-
-    // Fallback: find by coordinate (date range is typically top-right toolbar area)
-    if (!datePickerClicked) {
-      try {
-        const rect = await page.evaluate(() => {
-          // Look for elements containing date-like text in the toolbar
-          const allEls = document.querySelectorAll("material-button, button, [role='button']");
-          for (const el of allEls) {
-            const text = el.textContent?.trim() || "";
-            // Match date patterns like "1. Feb – 7. Feb" or "Last 7 days"
-            if (/\d{1,2}\.\s*(Jan|Feb|Mär|Apr|Mai|Jun|Jul|Aug|Sep|Okt|Nov|Dez)/i.test(text) ||
-                /letzte|last|zeitraum|date range/i.test(text)) {
-              const r = el.getBoundingClientRect();
-              if (r.width > 0 && r.height > 0 && r.y < 200) { // toolbar is at top
-                return { x: r.x, y: r.y, width: r.width, height: r.height };
-              }
-            }
-          }
-          return null;
-        });
-        if (rect) {
-          await page.mouse.click(rect.x + rect.width / 2, rect.y + rect.height / 2);
-          datePickerClicked = true;
-          console.log("   Clicked date picker via coordinate fallback");
-          await page.waitForTimeout(2000);
-        }
-      } catch {}
-    }
-
-    if (!datePickerClicked) {
-      console.log("   ⚠️  Could not find date picker — using default date range");
-      await page.screenshot({ path: path.join(screenshotDir, "date-picker-not-found.png") });
-      return;
-    }
-
-    await page.screenshot({ path: path.join(screenshotDir, "date-picker-open.png") });
-
-    // Select "Letzte 7 Tage" from the predefined options
-    const rangeSelectors = [
-      'text="Letzte 7 Tage"',
-      'text="Last 7 days"',
-      'li:has-text("Letzte 7 Tage")',
-      'li:has-text("Last 7 days")',
-      '[role="menuitem"]:has-text("7 Tage")',
-      '[role="menuitem"]:has-text("7 days")',
-      '[role="option"]:has-text("7 Tage")',
-      '[role="option"]:has-text("7 days")',
-    ];
-
-    let rangeSelected = false;
-    for (const sel of rangeSelectors) {
-      try {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 5000 })) {
-          await el.click();
-          rangeSelected = true;
-          console.log(`   ✅ Selected "Letzte 7 Tage" via: ${sel}`);
-          await page.waitForTimeout(2000);
-          break;
-        }
-      } catch {}
-    }
-
-    if (!rangeSelected) {
-      console.log("   ⚠️  'Letzte 7 Tage' option not found");
-      await page.screenshot({ path: path.join(screenshotDir, "date-range-options.png") });
-      return;
-    }
-
-    // Click "Anwenden" / "Apply" to confirm the date range
-    for (const btnName of ["Anwenden", "Apply", "Übernehmen"]) {
-      try {
-        const btn = page.locator(`text="${btnName}"`).first();
-        if (await btn.isVisible({ timeout: 3000 })) {
-          await btn.click();
-          console.log(`   ✅ Date range applied via "${btnName}"`);
-          await page.waitForTimeout(5000);
-          // Wait for dashboard to reload with new data
-          await page.waitForLoadState("networkidle").catch(() => {});
-          break;
-        }
-      } catch {}
-    }
-
-    await page.screenshot({ path: path.join(screenshotDir, "date-range-applied.png") });
-    console.log("   📅 Date range set successfully");
-  } catch (e) {
-    console.log(`   Date range error: ${e.message}`);
-  }
-}
 
 // ============================================================
 // SCRAPE TABLE DATA
@@ -484,37 +404,6 @@ async function scrapeTableData(page) {
 }
 
 // ============================================================
-// SEND DATA TO n8n WEBHOOK
-// ============================================================
-
-async function sendToWebhook(tableData) {
-  console.log(`📤 Sending ${tableData.length} rows to n8n webhook...`);
-
-  if (tableData.length === 0) {
-    console.log("   ⚠️  No data to send");
-    return false;
-  }
-
-  try {
-    const response = await axios.post(
-      CONFIG.webhookUrl,
-      {
-        auctionData: tableData,
-        timestamp: new Date().toISOString(),
-        dashboard: CONFIG.dashboardName,
-        mccAccount: CONFIG.mccAccountId,
-      },
-      { headers: { "Content-Type": "application/json" }, timeout: 30000 }
-    );
-    console.log(`   ✅ Webhook response: ${response.status}`);
-    return true;
-  } catch (err) {
-    console.error(`   ❌ Webhook error: ${err.message}`);
-    return false;
-  }
-}
-
-// ============================================================
 // MAIN
 // ============================================================
 
@@ -528,24 +417,24 @@ async function runOnce(context) {
     throw new Error(`Dashboard "${CONFIG.dashboardName}" failed to load`);
   }
 
-  // Set date range to "Letzte 7 Tage"
-  await setDateRange(dashPage);
 
   // Scrape table data from DOM
   const tableData = await scrapeTableData(dashPage);
 
-  // Send to n8n webhook
-  const success = await sendToWebhook(tableData);
-
-  const timestamp = new Date().toISOString().split("T")[0];
+  const timestamp = new Date().toISOString();
   console.log(`\n${"=".repeat(50)}`);
   console.log("📋 SUMMARY");
   console.log(`${"=".repeat(50)}`);
   console.log(`   Date: ${timestamp}`);
   console.log(`   Rows extracted: ${tableData.length}`);
-  console.log(`   Webhook: ${success ? "✅ sent" : "❌ failed"}`);
 
-  return { rows: tableData.length, success };
+  return {
+    auctionData: tableData,
+    timestamp,
+    dashboard: CONFIG.dashboardName,
+    mccAccount: CONFIG.mccAccountId,
+    rows: tableData.length,
+  };
 }
 
 async function main() {
@@ -555,7 +444,7 @@ async function main() {
   console.log("=======================================\n");
   console.log(`   MCC Account: ${CONFIG.mccAccountId}`);
   console.log(`   Dashboard:   ${CONFIG.dashboardName}`);
-  console.log(`   Method:      DOM Scraping → n8n Webhook`);
+  console.log(`   Method:      DOM Scraping → JSON API`);
   console.log(`   Mode:        ${once ? "single run" : "weekly (every 7 days)"}\n`);
 
   await ensureDirs();
@@ -631,14 +520,74 @@ async function loginOnly() {
 }
 
 // ============================================================
+// HTTP SERVER (health check & manual trigger)
+// ============================================================
+
+let lastRun = null;
+let lastError = null;
+let running = false;
+
+function startServer() {
+  const PORT = process.env.PORT || 3000;
+  const server = http.createServer(async (req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", lastRun, lastError, running }));
+    } else if (req.url === "/run" && req.method === "POST") {
+      if (running) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "already running" }));
+        return;
+      }
+      try {
+        const result = await triggerRun();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    } else {
+      res.writeHead(404);
+      res.end("Not found");
+    }
+  });
+  server.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
+}
+
+async function triggerRun() {
+  running = true;
+  lastError = null;
+  let context;
+  try {
+    await ensureDirs();
+    context = await launchBrowser();
+    const result = await runOnce(context);
+    lastRun = { date: result.timestamp, rows: result.rows };
+    console.log("✅ Triggered run complete.");
+    return result;
+  } catch (err) {
+    lastError = err.message;
+    console.error("❌ Triggered run failed:", err.message);
+    throw err;
+  } finally {
+    running = false;
+    if (context) await context.close().catch(() => {});
+  }
+}
+
+// ============================================================
 // ENTRY POINT
 // ============================================================
 
 if (process.argv.includes("--login-only")) {
   loginOnly().catch(console.error);
-} else {
+} else if (process.argv.includes("--once")) {
   main().catch((err) => {
     console.error(err);
     process.exit(1);
   });
+} else {
+  // Default: HTTP server only, scrape triggered via POST /run
+  startServer();
 }
