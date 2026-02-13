@@ -1,46 +1,40 @@
-process.env.DISPLAY = ":99";
 const { chromium } = require("playwright");
-const http = require("http");
 const path = require("path");
 const fs = require("fs");
+const http = require("http");
 const { execSync } = require("child_process");
 
 // ============================================================
 // CONFIGURATION
 // ============================================================
 const CONFIG = {
-  // MCC Account ID
   mccAccountId: "612-310-3619",
 
-  // Dashboard name and ID
-  dashboardName: "Auktion_ROB_Weekly",
-  dashboardId: "5468641",
-
-  // Working directory (screenshots, logs)
   downloadDir: path.join(__dirname, "downloads"),
-
-  // Browser state directory
   userDataDir: path.join(__dirname, "browser-data"),
 
-  // Headless mode
   headless: false,
-
-  // Slow down actions (ms)
   slowMo: 100,
-
-  // Timeout for page loads (ms)
   timeout: 60000,
 
-  // Keep-alive interval (ms)
-  keepAliveInterval: 6 * 60 * 60 * 1000, // 6 hours
+  // HTTP API port (n8n triggers this)
+  apiPort: 3000,
 
-  // Email alert settings
+  // Keep-alive interval (ms)
+  keepAliveInterval: 6 * 60 * 60 * 1000,
+
   alert: {
     enabled: true,
-    to: "kastri.asani@hurra.com",
+    to: "kastri@mikgroup.ch",
     from: "scraper@gads-automation.local",
   },
 };
+
+const DASHBOARDS = [
+  { key: "ROB", url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5468641&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
+  { key: "TML", url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5484865&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
+  { key: "TBL", url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5524802&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
+];
 
 // ============================================================
 // ALERTING
@@ -58,14 +52,9 @@ async function sendAlert(subject, body) {
         `sendmail ${CONFIG.alert.to} < ${tmpFile} 2>/dev/null || mail -s "${subject}" ${CONFIG.alert.to} < ${tmpFile} 2>/dev/null`,
         { timeout: 10000 }
       );
-      console.log(`   ✅ Alert sent to ${CONFIG.alert.to}`);
-    } catch {
-      console.log(`   ⚠️  Mail command failed — install msmtp: apt install msmtp msmtp-mta`);
-    }
+    } catch {}
     try { fs.unlinkSync(tmpFile); } catch {}
-  } catch (e) {
-    console.log(`   Alert error: ${e.message}`);
-  }
+  } catch {}
 }
 
 // ============================================================
@@ -82,15 +71,14 @@ function startKeepAlive(context) {
       if (pages.length === 0) return;
       const p = pages[0];
       await p.goto("https://ads.google.com/aw/overview", {
-        timeout: 30000,
-        waitUntil: "domcontentloaded",
+        timeout: 30000, waitUntil: "domcontentloaded",
       }).catch(() => {});
       const isLoggedIn = p.url().includes("ads.google.com/aw/");
       console.log(`🔄 Keep-alive: ${isLoggedIn ? "✅ active" : "⚠️ expired"} (${new Date().toISOString()})`);
       if (!isLoggedIn) {
         await sendAlert(
           "[GAds Scraper] Session abgelaufen",
-          `Bitte einloggen via VNC:\nhttp://49.12.229.75:6080/vnc.html\n\nZeit: ${new Date().toISOString()}`
+          `VNC: http://49.12.229.75:6080/vnc.html\nZeit: ${new Date().toISOString()}`
         );
       }
     } catch (e) {
@@ -98,13 +86,6 @@ function startKeepAlive(context) {
     }
   }, CONFIG.keepAliveInterval);
   console.log(`🔄 Keep-alive started (every ${CONFIG.keepAliveInterval / 3600000}h)`);
-}
-
-function stopKeepAlive() {
-  if (keepAliveTimer) {
-    clearInterval(keepAliveTimer);
-    keepAliveTimer = null;
-  }
 }
 
 // ============================================================
@@ -118,12 +99,6 @@ async function ensureDirs() {
 }
 
 async function launchBrowser() {
-  // Clean stale lock files that prevent browser launch
-  for (const f of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
-    const p = path.join(CONFIG.userDataDir, f);
-    try { fs.unlinkSync(p); } catch {}
-  }
-
   return await chromium.launchPersistentContext(CONFIG.userDataDir, {
     headless: CONFIG.headless,
     slowMo: CONFIG.slowMo,
@@ -132,8 +107,6 @@ async function launchBrowser() {
       "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-session-crashed-bubble",
-      "--disable-infobars",
     ],
     ignoreDefaultArgs: ["--enable-automation"],
   });
@@ -159,17 +132,12 @@ async function waitForAdsPage(context, timeoutMs = 300000) {
       clearTimeout(timeout);
       clearInterval(interval);
       context.removeListener("page", onNewPage);
-      try { console.log(`   [waitForAdsPage] Resolved via ${source}: ${p.url()}`); } catch {}
       resolve(p);
     };
 
     const checkPages = () => {
       pollCount++;
       const pages = context.pages();
-      if (pollCount % 5 === 1) {
-        const urls = pages.map((p) => { try { return p.url(); } catch { return "(closed)"; } });
-        console.log(`   [waitForAdsPage] Poll #${pollCount}, ${pages.length} tab(s): ${JSON.stringify(urls)}`);
-      }
       for (const p of pages) {
         try {
           if (p.url().includes("ads.google.com/aw/")) {
@@ -181,12 +149,9 @@ async function waitForAdsPage(context, timeoutMs = 300000) {
     };
 
     const onNewPage = (newPage) => {
-      console.log("   [waitForAdsPage] New tab opened");
       const checkNew = () => {
         try {
-          if (newPage.url().includes("ads.google.com/aw/")) {
-            tryResolve(newPage, "newTab");
-          }
+          if (newPage.url().includes("ads.google.com/aw/")) tryResolve(newPage, "newTab");
         } catch {}
       };
       setTimeout(checkNew, 2000);
@@ -201,24 +166,22 @@ async function waitForAdsPage(context, timeoutMs = 300000) {
 }
 
 async function login(context) {
-  let page = context.pages()[0] || (await context.newPage());
+  const page = context.pages()[0] || (await context.newPage());
 
   console.log("🔐 Navigating to Google Ads...");
   try {
     await page.goto("https://ads.google.com", { waitUntil: "networkidle", timeout: CONFIG.timeout });
   } catch (e) {
     console.log("   Navigation: " + e.message.split("\n")[0]);
-    // If page is dead (restored from crashed session), create a fresh one
-    if (e.message.includes("Target page, context or browser has been closed")) {
-      console.log("   ↪ Page crashed, opening new tab...");
-      page = await context.newPage();
-      try {
-        await page.goto("https://ads.google.com", { waitUntil: "networkidle", timeout: CONFIG.timeout });
-      } catch (e2) {
-        console.log("   Navigation retry: " + e2.message.split("\n")[0]);
-      }
-    }
   }
+
+  // Handle business.google.com redirect
+  try {
+    if (page.url().includes("business.google.com")) {
+      console.log("   Redirecting from business.google.com...");
+      await page.goto("https://ads.google.com/aw/overview", { waitUntil: "networkidle", timeout: CONFIG.timeout });
+    }
+  } catch {}
 
   // Handle cookie consent
   try {
@@ -228,7 +191,6 @@ async function login(context) {
           const el = page.locator(sel).first();
           if (await el.isVisible({ timeout: 3000 })) {
             await el.click();
-            console.log("   ✅ Cookie consent handled");
             await page.waitForTimeout(3000);
             break;
           }
@@ -237,34 +199,18 @@ async function login(context) {
     }
   } catch {}
 
-  // Redirect from business.google.com to actual Ads interface
+  // Handle MCC account picker
   try {
-    if (page.url().includes("business.google.com")) {
-      console.log("   ↪ Redirecting from business.google.com to ads.google.com...");
-      await page.goto("https://ads.google.com/aw/overview", { waitUntil: "domcontentloaded", timeout: CONFIG.timeout });
-      await page.waitForTimeout(3000);
-    }
-  } catch {}
-
-  // Handle MCC account picker ("Google Ads-Konto auswählen")
-  try {
-    const hasAccountPicker = await page.locator(':text("Konto auswählen"), :text("Choose an account")').first().isVisible({ timeout: 3000 });
-    if (hasAccountPicker) {
-      console.log("   🏢 Account picker detected, selecting MCC account...");
-      for (const sel of [
-        `:text("${CONFIG.mccAccountId}")`,
-        ':text("Hurra Communications")',
-        `[data-account-id*="${CONFIG.mccAccountId.replace(/-/g, "")}"]`,
-      ]) {
-        try {
-          const el = page.locator(sel).first();
-          if (await el.isVisible({ timeout: 3000 })) {
-            await el.click();
-            console.log(`   ✅ Selected account via: ${sel}`);
-            await page.waitForTimeout(5000);
-            break;
-          }
-        } catch {}
+    const pickerVisible = await page.locator('text="Konto auswählen", text="Choose an account"')
+      .first().isVisible({ timeout: 5000 }).catch(() => false);
+    if (pickerVisible) {
+      console.log("   MCC account picker detected");
+      const account = page.locator(`text="${CONFIG.mccAccountId}"`).first();
+      if (await account.isVisible({ timeout: 3000 })) {
+        await account.click();
+        console.log("   ✅ Selected MCC account");
+        await page.waitForTimeout(5000);
+        await page.waitForLoadState("networkidle").catch(() => {});
       }
     }
   } catch {}
@@ -278,7 +224,7 @@ async function login(context) {
   } catch {}
 
   // Need manual login
-  console.log("\n⚠️  LOGIN REQUIRED — bitte manuell einloggen via VNC\n");
+  console.log("\n⚠️  LOGIN REQUIRED\n");
   await sendAlert(
     "[GAds Scraper] Login nötig",
     `VNC: http://49.12.229.75:6080/vnc.html\nZeit: ${new Date().toISOString()}`
@@ -287,7 +233,6 @@ async function login(context) {
   const adsPage = await waitForAdsPage(context);
   await new Promise((r) => setTimeout(r, 5000));
   try { await adsPage.waitForLoadState("networkidle"); } catch {}
-
   console.log("✅ Login successful!");
   return adsPage;
 }
@@ -296,46 +241,21 @@ async function login(context) {
 // DASHBOARD
 // ============================================================
 
-async function openDashboard(page, context) {
-  console.log(`📊 Opening dashboard: ${CONFIG.dashboardName}`);
-
-  // Extract auth params
-  let authParams = {};
-  for (const p of context.pages()) {
-    try {
-      const url = p.url();
-      if (url.includes("ads.google.com")) {
-        const parsed = new URL(url);
-        for (const key of ["ocid", "ascid", "euid", "__u", "uscid", "__c", "authuser"]) {
-          if (parsed.searchParams.has(key)) authParams[key] = parsed.searchParams.get(key);
-        }
-        if (Object.keys(authParams).length > 0) break;
-      }
-    } catch {}
-  }
-
-  const listUrl = new URL("https://ads.google.com/aw/dashboards");
-  for (const [key, val] of Object.entries(authParams)) listUrl.searchParams.set(key, val);
+async function openDashboard(page, dashboardUrl, dashboardKey) {
+  console.log(`📊 Opening dashboard: ${dashboardKey} (direct URL)`);
 
   try {
-    await page.goto(listUrl.toString(), { waitUntil: "networkidle", timeout: CONFIG.timeout });
+    await page.goto(dashboardUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
     await page.waitForTimeout(5000);
 
-    // Click dashboard name
-    await page.locator(`text="${CONFIG.dashboardName}"`).first().click();
-    await page.waitForTimeout(10000);
-    await page.waitForLoadState("networkidle").catch(() => {});
-
-    // Verify dashboard loaded (check for table or dashboard content)
     const loaded = await page.locator('.particle-table-row, [aria-label="Download"], [aria-label="Herunterladen"]')
-      .first().isVisible({ timeout: 15000 }).catch(() => false);
+      .first().isVisible({ timeout: 30000 }).catch(() => false);
 
     if (loaded) {
       console.log("   ✅ Dashboard loaded");
       return page;
     }
 
-    // Extra wait
     await page.waitForTimeout(10000);
     const retry = await page.locator('.particle-table-row').first().isVisible({ timeout: 10000 }).catch(() => false);
     if (retry) {
@@ -347,38 +267,141 @@ async function openDashboard(page, context) {
   }
 
   console.log("   ❌ Failed to load dashboard");
-  try { await page.screenshot({ path: path.join(CONFIG.downloadDir, "dashboard-error.png") }); } catch {}
+  try { await page.screenshot({ path: path.join(CONFIG.downloadDir, `dashboard-error-${dashboardKey}.png`) }); } catch {}
   return null;
 }
 
+// ============================================================
+// DATE RANGE
+// ============================================================
+
+async function setDateRange(page) {
+  console.log("📅 Setting date range: Letzte 7 Tage...");
+
+  try {
+    const dateSelectors = [
+      '[aria-label="Zeitraum"]',
+      '[aria-label="Date range"]',
+      'button:has-text("Letzte")',
+      'button:has-text("Last")',
+      'material-button:has-text("Feb")',
+      'material-button:has-text("Jan")',
+      'material-button:has-text("Mär")',
+      '[class*="date-range"]',
+      '[class*="dateRange"]',
+    ];
+
+    let datePickerClicked = false;
+    for (const sel of dateSelectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 3000 })) {
+          await el.click();
+          datePickerClicked = true;
+          console.log(`   Clicked date picker via: ${sel}`);
+          await page.waitForTimeout(2000);
+          break;
+        }
+      } catch {}
+    }
+
+    if (!datePickerClicked) {
+      try {
+        const rect = await page.evaluate(() => {
+          const allEls = document.querySelectorAll("material-button, button, [role='button']");
+          for (const el of allEls) {
+            const text = el.textContent?.trim() || "";
+            if (/\d{1,2}\.\s*(Jan|Feb|Mär|Apr|Mai|Jun|Jul|Aug|Sep|Okt|Nov|Dez)/i.test(text) ||
+                /letzte|last|zeitraum|date range/i.test(text)) {
+              const r = el.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0 && r.y < 200) {
+                return { x: r.x, y: r.y, width: r.width, height: r.height };
+              }
+            }
+          }
+          return null;
+        });
+        if (rect) {
+          await page.mouse.click(rect.x + rect.width / 2, rect.y + rect.height / 2);
+          datePickerClicked = true;
+          await page.waitForTimeout(2000);
+        }
+      } catch {}
+    }
+
+    if (!datePickerClicked) {
+      console.log("   ⚠️  Date picker not found");
+      return;
+    }
+
+    const rangeSelectors = [
+      'text="Letzte 7 Tage"', 'text="Last 7 days"',
+      'li:has-text("Letzte 7 Tage")', 'li:has-text("Last 7 days")',
+      '[role="menuitem"]:has-text("7 Tage")', '[role="option"]:has-text("7 Tage")',
+    ];
+
+    for (const sel of rangeSelectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 5000 })) {
+          await el.click();
+          console.log(`   ✅ Selected "Letzte 7 Tage"`);
+          await page.waitForTimeout(2000);
+          break;
+        }
+      } catch {}
+    }
+
+    for (const btnName of ["Anwenden", "Apply", "Übernehmen"]) {
+      try {
+        const btn = page.locator(`text="${btnName}"`).first();
+        if (await btn.isVisible({ timeout: 3000 })) {
+          await btn.click();
+          console.log(`   ✅ Date range applied`);
+          await page.waitForTimeout(5000);
+          await page.waitForLoadState("networkidle").catch(() => {});
+          break;
+        }
+      } catch {}
+    }
+  } catch (e) {
+    console.log(`   Date range error: ${e.message}`);
+  }
+}
 
 // ============================================================
 // SCRAPE TABLE DATA
 // ============================================================
 
-async function scrapeTableData(page) {
-  console.log("📊 Extracting table data from dashboard...");
+async function scrapeTableData(page, isFirstDashboard = true) {
+  console.log("📊 Extracting table data...");
 
-  // Wait for table to render
+  // Wait for data refresh - 60s for first dashboard, 15s for others
+  if (isFirstDashboard) {
+    console.log("   Waiting 60s for data refresh...");
+    for (let i = 60; i > 0; i -= 10) {
+      console.log(`   ${i}s remaining...`);
+      await page.waitForTimeout(10000);
+    }
+  } else {
+    console.log("   Waiting 15s for table data...");
+    await page.waitForTimeout(15000);
+  }
+
   try {
     await page.locator(".particle-table-row").first().waitFor({ state: "visible", timeout: 30000 });
-    console.log("   Table rows visible");
-  } catch {
-    console.log("   ⚠️  No table rows found, trying anyway...");
-  }
+  } catch {}
   await page.waitForTimeout(3000);
 
-  // Dismiss notification banners
+  // Dismiss banners
   try {
     const xBtn = page.locator('button[aria-label="Close"], button[aria-label="Schließen"]').first();
     if (await xBtn.isVisible({ timeout: 2000 })) {
       await xBtn.click();
-      console.log("   Dismissed notification banner");
       await page.waitForTimeout(1000);
     }
   } catch {}
 
-  // Extract data from DOM
   const tableData = await page.evaluate(() => {
     const rows = Array.from(document.querySelectorAll(".particle-table-row"));
     return rows.map((row) => {
@@ -396,111 +419,167 @@ async function scrapeTableData(page) {
   });
 
   console.log(`   ✅ Extracted ${tableData.length} rows`);
-  if (tableData.length > 0) {
-    console.log(`   First row: ${JSON.stringify(tableData[0])}`);
-  }
-
   return tableData;
+}
+
+// ============================================================
+// RUN ONCE (called by API)
+// ============================================================
+
+let isRunning = false;
+
+async function runOnce(context) {
+  if (isRunning) {
+    throw new Error("A scrape is already running");
+  }
+  isRunning = true;
+
+  try {
+    const page = await login(context);
+    const results = {};
+
+    for (let i = 0; i < DASHBOARDS.length; i++) {
+      const dash = DASHBOARDS[i];
+      console.log(`\n${"=".repeat(40)}`);
+      console.log(`📊 [${i + 1}/${DASHBOARDS.length}] Scraping ${dash.key} (${dash.name})`);
+      console.log(`${"=".repeat(40)}`);
+
+      const dashPage = await openDashboard(page, dash.url, dash.key);
+      if (!dashPage) {
+        console.log(`   ❌ ${dash.key} — dashboard failed to load`);
+        results[dash.key] = [];
+        continue;
+      }
+
+      // Set date range only on first dashboard
+      if (i === 0) {
+        await setDateRange(dashPage);
+      }
+
+      const tableData = await scrapeTableData(dashPage, i === 0);
+      results[dash.key] = tableData;
+      console.log(`   ✅ ${dash.key}: ${tableData.length} rows`);
+    }
+
+    const totalRows = Object.values(results).reduce((sum, arr) => sum + arr.length, 0);
+    console.log(`\n✅ All done: ${totalRows} total rows from ${DASHBOARDS.length} dashboards`);
+
+    return {
+      ...results,
+      timestamp: new Date().toISOString(),
+      mccAccount: CONFIG.mccAccountId,
+      totalRows,
+    };
+  } finally {
+    isRunning = false;
+  }
+}
+
+// ============================================================
+// HTTP API SERVER
+// ============================================================
+
+function startApiServer(context) {
+  const server = http.createServer(async (req, res) => {
+    // CORS headers
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    // Health check
+    if (req.url === "/health" || req.url === "/") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        status: "ok",
+        running: isRunning,
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+      }));
+      return;
+    }
+
+    // Trigger scrape
+    if (req.url === "/run" && (req.method === "GET" || req.method === "POST")) {
+      console.log(`\n🌐 API: /run triggered (${new Date().toISOString()})`);
+
+      try {
+        const result = await runOnce(context);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+
+        const dashboardList = DASHBOARDS.map(d => d.key).join(", ");
+        await sendAlert(
+          "[GAds Scraper] ✅ Erfolgreich",
+          `${result.totalRows} Zeilen extrahiert aus ${DASHBOARDS.length} Dashboards (${dashboardList}).\nZeit: ${new Date().toISOString()}`
+        );
+      } catch (err) {
+        console.error(`❌ API error: ${err.message}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+
+        await sendAlert(
+          "[GAds Scraper] ❌ Fehlgeschlagen",
+          `Fehler: ${err.message}\nVNC: http://49.12.229.75:6080/vnc.html`
+        );
+      }
+      return;
+    }
+
+    // 404
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found. Use GET /run or GET /health" }));
+  });
+
+  server.listen(CONFIG.apiPort, "0.0.0.0", () => {
+    console.log(`\n🌐 API server listening on http://0.0.0.0:${CONFIG.apiPort}`);
+    console.log(`   Endpoints:`);
+    console.log(`   GET  /health  — Status check`);
+    console.log(`   POST /run     — Trigger scrape, returns JSON data`);
+    console.log(`   GET  /run     — Same (for easy testing)\n`);
+  });
+
+  return server;
 }
 
 // ============================================================
 // MAIN
 // ============================================================
 
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-
-async function runOnce(context) {
-  const page = await login(context);
-
-  const dashPage = await openDashboard(page, context);
-  if (!dashPage) {
-    throw new Error(`Dashboard "${CONFIG.dashboardName}" failed to load`);
-  }
-
-
-  // Scrape table data from DOM
-  const tableData = await scrapeTableData(dashPage);
-
-  const timestamp = new Date().toISOString();
-  console.log(`\n${"=".repeat(50)}`);
-  console.log("📋 SUMMARY");
-  console.log(`${"=".repeat(50)}`);
-  console.log(`   Date: ${timestamp}`);
-  console.log(`   Rows extracted: ${tableData.length}`);
-
-  return {
-    auctionData: tableData,
-    timestamp,
-    dashboard: CONFIG.dashboardName,
-    mccAccount: CONFIG.mccAccountId,
-    rows: tableData.length,
-  };
-}
-
 async function main() {
-  const once = process.argv.includes("--once");
-
   console.log("🚀 Google Ads Auction Insights Scraper");
   console.log("=======================================\n");
   console.log(`   MCC Account: ${CONFIG.mccAccountId}`);
-  console.log(`   Dashboard:   ${CONFIG.dashboardName}`);
-  console.log(`   Method:      DOM Scraping → JSON API`);
-  console.log(`   Mode:        ${once ? "single run" : "weekly (every 7 days)"}\n`);
+  console.log(`   Dashboards:  ${DASHBOARDS.map(d => d.key).join(", ")}`);
+  console.log(`   Mode:        HTTP API on port ${CONFIG.apiPort}`);
+  console.log(`   Trigger:     POST http://49.12.229.75:${CONFIG.apiPort}/run\n`);
 
   await ensureDirs();
   const context = await launchBrowser();
 
-  try {
-    await runOnce(context);
+  // Start keep-alive to prevent session expiry
+  startKeepAlive(context);
 
-    if (once) {
-      console.log("\n✅ Single run complete. Exiting.");
-      return;
+  // Start HTTP API server — n8n triggers /run
+  startApiServer(context);
+
+  // If --once flag, do a single run and exit
+  if (process.argv.includes("--once")) {
+    try {
+      const result = await runOnce(context);
+      console.log(JSON.stringify(result, null, 2));
+    } catch (err) {
+      console.error(`❌ ${err.message}`);
     }
-
-    startKeepAlive(context);
-
-    while (true) {
-      const nextRun = new Date(Date.now() + WEEK_MS);
-      console.log(`\n⏰ Next run: ${nextRun.toISOString()}`);
-      await new Promise((r) => setTimeout(r, WEEK_MS));
-
-      console.log(`\n${"=".repeat(50)}`);
-      console.log(`🔄 Weekly run: ${new Date().toISOString()}`);
-      console.log(`${"=".repeat(50)}\n`);
-
-      try {
-        const result = await runOnce(context);
-        await sendAlert(
-          "[GAds Scraper] ✅ Erfolgreich",
-          `${result.rows} Zeilen extrahiert und an n8n gesendet.\nZeit: ${new Date().toISOString()}`
-        );
-      } catch (err) {
-        console.error(`\n❌ Weekly run failed: ${err.message}`);
-        await sendAlert(
-          "[GAds Scraper] ❌ Fehlgeschlagen",
-          `Fehler: ${err.message}\n\nVNC: http://49.12.229.75:6080/vnc.html\nZeit: ${new Date().toISOString()}`
-        );
-        try {
-          const pages = context.pages();
-          if (pages.length > 0) {
-            await pages[pages.length - 1].screenshot({
-              path: path.join(CONFIG.downloadDir, "error-screenshot.png"),
-            });
-          }
-        } catch {}
-      }
-    }
-  } catch (err) {
-    console.error(`\n❌ Fatal error: ${err.message}`);
-    await sendAlert(
-      "[GAds Scraper] ❌ Fatal Error",
-      `Scraper gestoppt: ${err.message}\nZeit: ${new Date().toISOString()}`
-    );
-  } finally {
-    stopKeepAlive();
-    await context.close();
+    process.exit(0);
   }
+
+  console.log("⏳ Waiting for API requests...\n");
 }
 
 // ============================================================
@@ -513,66 +592,9 @@ async function loginOnly() {
   const context = await launchBrowser();
   try {
     await login(context);
-    console.log("\n✅ Login session saved to: " + CONFIG.userDataDir);
+    console.log("\n✅ Login session saved.");
   } finally {
     await context.close();
-  }
-}
-
-// ============================================================
-// HTTP SERVER (health check & manual trigger)
-// ============================================================
-
-let lastRun = null;
-let lastError = null;
-let running = false;
-
-function startServer() {
-  const PORT = process.env.PORT || 3000;
-  const server = http.createServer(async (req, res) => {
-    if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", lastRun, lastError, running }));
-    } else if (req.url === "/run" && req.method === "POST") {
-      if (running) {
-        res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "already running" }));
-        return;
-      }
-      try {
-        const result = await triggerRun();
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result));
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
-      }
-    } else {
-      res.writeHead(404);
-      res.end("Not found");
-    }
-  });
-  server.listen(PORT, () => console.log(`🌐 HTTP server listening on port ${PORT}`));
-}
-
-async function triggerRun() {
-  running = true;
-  lastError = null;
-  let context;
-  try {
-    await ensureDirs();
-    context = await launchBrowser();
-    const result = await runOnce(context);
-    lastRun = { date: result.timestamp, rows: result.rows };
-    console.log("✅ Triggered run complete.");
-    return result;
-  } catch (err) {
-    lastError = err.message;
-    console.error("❌ Triggered run failed:", err.message);
-    throw err;
-  } finally {
-    running = false;
-    if (context) await context.close().catch(() => {});
   }
 }
 
@@ -582,12 +604,9 @@ async function triggerRun() {
 
 if (process.argv.includes("--login-only")) {
   loginOnly().catch(console.error);
-} else if (process.argv.includes("--once")) {
+} else {
   main().catch((err) => {
     console.error(err);
     process.exit(1);
   });
-} else {
-  // Default: HTTP server only, scrape triggered via POST /run
-  startServer();
 }
