@@ -31,9 +31,9 @@ const CONFIG = {
 };
 
 const DASHBOARDS = [
-  { key: "ROB", url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5468641&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
-  { key: "TML", url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5484865&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
-  { key: "TBL", url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5524802&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
+  { key: "ROB", colOffset: 0, url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5468641&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
+  { key: "TML", colOffset: 1, url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5484865&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
+  { key: "TBL", colOffset: 1, url: "https://ads.google.com/aw/dashboards/view?ocid=1787237&ascid=1787237&dashboardId=5524802&euid=1293959655&__u=7376522095&uscid=1787237&__c=2818649213&authuser=0" },
 ];
 
 // ============================================================
@@ -373,8 +373,8 @@ async function setDateRange(page) {
 // SCRAPE TABLE DATA
 // ============================================================
 
-async function scrapeTableData(page, isFirstDashboard = true) {
-  console.log("📊 Extracting table data...");
+async function scrapeTableData(page, isFirstDashboard = true, colOffset = 0) {
+  console.log(`📊 Extracting table data (colOffset=${colOffset})...`);
 
   // Wait for data refresh - 60s for first dashboard, 15s for others
   if (isFirstDashboard) {
@@ -402,21 +402,24 @@ async function scrapeTableData(page, isFirstDashboard = true) {
     }
   } catch {}
 
-  const tableData = await page.evaluate(() => {
+  const tableData = await page.evaluate((offset) => {
     const rows = Array.from(document.querySelectorAll(".particle-table-row"));
     return rows.map((row) => {
       const cells = Array.from(row.querySelectorAll("ess-cell"));
+      // Field mapping with offset for TML/TBL (extra Kundennummer column)
+      // ROB (offset=0): cells = [domain, imprShare, ..., overlapRate, ..., absTopRate]
+      // TML/TBL (offset=1): cells = [Kundennr, domain, imprShare, ..., overlapRate, ..., absTopRate]
       return {
-        domain: cells[0]?.innerText.trim(),
-        imprShare: cells[1]?.innerText.trim(),
-        overlapRate: cells[2]?.innerText.trim(),
-        aboveRate: cells[3]?.innerText.trim(),
-        topOfPage: cells[4]?.innerText.trim(),
-        absTop: cells[5]?.innerText.trim(),
-        outranking: cells[6]?.innerText.trim(),
+        domain: cells[0 + offset]?.innerText.trim(),
+        imprShare: cells[1 + offset]?.innerText.trim(),
+        overlapRate: cells[2 + offset]?.innerText.trim(),
+        aboveRate: cells[3 + offset]?.innerText.trim(),
+        topOfPage: cells[4 + offset]?.innerText.trim(),
+        absTop: cells[5 + offset]?.innerText.trim(),
+        outranking: cells[6 + offset]?.innerText.trim(),
       };
     });
-  });
+  }, colOffset);
 
   console.log(`   ✅ Extracted ${tableData.length} rows`);
   return tableData;
@@ -441,7 +444,7 @@ async function runOnce(context) {
     for (let i = 0; i < DASHBOARDS.length; i++) {
       const dash = DASHBOARDS[i];
       console.log(`\n${"=".repeat(40)}`);
-      console.log(`📊 [${i + 1}/${DASHBOARDS.length}] Scraping ${dash.key} (${dash.name})`);
+      console.log(`📊 [${i + 1}/${DASHBOARDS.length}] Scraping ${dash.key}`);
       console.log(`${"=".repeat(40)}`);
 
       const dashPage = await openDashboard(page, dash.url, dash.key);
@@ -456,7 +459,7 @@ async function runOnce(context) {
         await setDateRange(dashPage);
       }
 
-      const tableData = await scrapeTableData(dashPage, i === 0);
+      const tableData = await scrapeTableData(dashPage, i === 0, dash.colOffset);
       results[dash.key] = tableData;
       console.log(`   ✅ ${dash.key}: ${tableData.length} rows`);
     }
