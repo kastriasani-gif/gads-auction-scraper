@@ -199,18 +199,25 @@ async function login(context) {
     }
   } catch {}
 
-  // Handle MCC account picker
+  // Handle MCC account picker (URL: /nav/selectaccount)
   try {
-    const pickerVisible = await page.locator('text="Konto auswählen", text="Choose an account"')
-      .first().isVisible({ timeout: 5000 }).catch(() => false);
-    if (pickerVisible) {
-      console.log("   MCC account picker detected");
+    if (page.url().includes("selectaccount") || page.url().includes("nav/select")) {
+      console.log("   MCC account picker detected (via URL)");
       const account = page.locator(`text="${CONFIG.mccAccountId}"`).first();
-      if (await account.isVisible({ timeout: 3000 })) {
+      if (await account.isVisible({ timeout: 5000 })) {
         await account.click();
         console.log("   ✅ Selected MCC account");
         await page.waitForTimeout(5000);
         await page.waitForLoadState("networkidle").catch(() => {});
+      } else {
+        // Try clicking by partial text match (account name)
+        const byName = page.locator('text="Hurra Communications"').first();
+        if (await byName.isVisible({ timeout: 3000 })) {
+          await byName.click();
+          console.log("   ✅ Selected MCC account (by name)");
+          await page.waitForTimeout(5000);
+          await page.waitForLoadState("networkidle").catch(() => {});
+        }
       }
     }
   } catch {}
